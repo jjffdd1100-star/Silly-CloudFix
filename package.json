@@ -1,0 +1,13 @@
+{
+  "name": "silly-cloudfix",
+  "version": "1.0.0",
+  "description": "JanitorAI Cloud character & public lorebooks direct downloader for SillyTavern",
+  "main": "index.js",
+  "type": "module",
+  "author": "gong",
+  "homepage": "https://github.com/jjffdd1100-star/Silly-CloudFix",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jjffdd1100-star/Silly-CloudFix.git"
+  }
+}
