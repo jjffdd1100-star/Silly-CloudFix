@@ -14,6 +14,7 @@
       --accent: #10b981;
       --accent-hover: #059669;
       --danger: #ef4444;
+      --warn: #f59e0b;
       --text-main: #f3f4f6;
       --text-sub: #9ca3af;
       --code-bg: #11131c;
@@ -35,10 +36,10 @@
     }
     .container {
       width: 100%;
-      max-width: 720px;
+      max-width: 740px;
       display: flex;
       flex-direction: column;
-      gap: 24px;
+      gap: 20px;
     }
     .header {
       text-align: center;
@@ -56,12 +57,88 @@
       color: var(--text-sub);
       font-size: 0.95rem;
     }
+    .header p.header-subhint {
+      font-size: 0.82rem;
+      margin-top: 6px;
+      line-height: 1.5;
+    }
+    .header p.header-subhint a {
+      color: #93c5fd;
+      text-decoration: underline;
+      text-underline-offset: 3px;
+      word-break: break-all;
+    }
+    .header p.header-subhint a:hover {
+      color: #bfdbfe;
+    }
     .card {
       background: var(--card-bg);
       border: 1px solid var(--border-color);
       border-radius: var(--radius);
       padding: 24px;
       box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+    }
+    .server-panel {
+      display: none;
+    }
+    .status-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .status-title {
+      font-weight: 700;
+      font-size: 1rem;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.78rem;
+      font-weight: 700;
+      padding: 4px 10px;
+      border-radius: 999px;
+    }
+    .badge-ok {
+      background: rgba(16, 185, 129, 0.16);
+      color: #6ee7b7;
+      border: 1px solid rgba(16, 185, 129, 0.4);
+    }
+    .badge-warn {
+      background: rgba(245, 158, 11, 0.16);
+      color: #fcd34d;
+      border: 1px solid rgba(245, 158, 11, 0.4);
+    }
+    .badge-err {
+      background: rgba(239, 68, 68, 0.16);
+      color: #fca5a5;
+      border: 1px solid rgba(239, 68, 68, 0.4);
+    }
+    .status-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .status-item {
+      background: var(--code-bg);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 0.82rem;
+    }
+    .status-item .k {
+      color: var(--text-sub);
+      display: block;
+      margin-bottom: 2px;
+    }
+    .status-item .v {
+      color: var(--text-main);
+      font-weight: 600;
+      word-break: break-word;
     }
     label {
       display: block;
@@ -89,6 +166,7 @@
     }
     .btn-row {
       display: flex;
+      flex-wrap: wrap;
       gap: 10px;
       margin-top: 14px;
     }
@@ -96,7 +174,7 @@
       cursor: pointer;
       font-weight: 600;
       font-size: 0.9rem;
-      padding: 10px 18px;
+      padding: 10px 16px;
       border-radius: 8px;
       border: none;
       transition: all 0.2s;
@@ -105,39 +183,48 @@
       justify-content: center;
       gap: 6px;
     }
+    button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
     .btn-primary {
       background: var(--primary);
       color: #fff;
       flex: 1;
     }
-    .btn-primary:hover {
+    .btn-primary:hover:not(:disabled) {
       background: var(--primary-hover);
     }
     .btn-secondary {
       background: #2e3446;
       color: var(--text-main);
     }
-    .btn-secondary:hover {
+    .btn-secondary:hover:not(:disabled) {
       background: #3b4258;
     }
     .btn-success {
       background: var(--accent);
       color: #fff;
     }
-    .btn-success:hover {
+    .btn-success:hover:not(:disabled) {
       background: var(--accent-hover);
     }
     .alert {
       padding: 12px 16px;
       border-radius: 8px;
       font-size: 0.88rem;
-      margin-top: 16px;
+      margin-top: 14px;
       display: none;
     }
     .alert-error {
       background: rgba(239, 68, 68, 0.15);
       border: 1px solid var(--danger);
       color: #fca5a5;
+    }
+    .alert-success {
+      background: rgba(16, 185, 129, 0.15);
+      border: 1px solid var(--accent);
+      color: #6ee7b7;
     }
     .result-section {
       display: none;
@@ -176,7 +263,7 @@
       border-radius: 8px;
       padding: 14px;
       position: relative;
-      margin-top: 16px;
+      margin-top: 10px;
     }
     .json-preview pre {
       color: #a7f3d0;
@@ -218,26 +305,63 @@
       font-family: Consolas, monospace;
       font-size: 0.82rem;
     }
+    .server-only {
+      display: none;
+    }
   </style>
 </head>
 <body>
   <div class="container">
     <div class="header">
       <h1>☁️ Janitor Token Extractor</h1>
-      <p>Silly-CloudFix 전용: 복잡한 문자열 속에서 토큰을 자동 추출합니다.</p>
+      <p>Silly-CloudFix 전용: 복잡한 쿠키/헤더 문자열 속에서 토큰을 자동 추출합니다.</p>
+      <p class="header-subhint" id="serverRedirectHint">💡 실리태번 서버가 켜져 있다면 <a href="http://127.0.0.1:8000/api/plugins/silly-cloudfix/">http://127.0.0.1:8000/api/plugins/silly-cloudfix/</a> 로 접속하여 상태 확인 및 원클릭 저장도 가능합니다.</p>
     </div>
 
-    <!-- Main Card -->
+    <!-- Live Server Diagnostics Panel (Shown automatically when opened via SillyTavern HTTP URL) -->
+    <div class="card server-panel" id="serverPanel">
+      <div class="status-header">
+        <span class="status-title">🔌 Silly-CloudFix 플러그인 연결 상태</span>
+        <span class="badge badge-warn" id="statusBadge">확인 중...</span>
+      </div>
+      <div class="status-grid">
+        <div class="status-item">
+          <span class="k">인터셉터 상태</span>
+          <span class="v" id="stInterceptor">-</span>
+        </div>
+        <div class="status-item">
+          <span class="k">인증 소스</span>
+          <span class="v" id="stSource">-</span>
+        </div>
+        <div class="status-item">
+          <span class="k">액세스 토큰 만료</span>
+          <span class="v" id="stExpiry">-</span>
+        </div>
+        <div class="status-item">
+          <span class="k">리프레시 토큰</span>
+          <span class="v" id="stRefresh">-</span>
+        </div>
+      </div>
+      <div class="btn-row" style="margin-top: 0;">
+        <button class="btn-secondary" id="btnServerRefresh">🔄 지금 토큰 갱신 테스트</button>
+        <button class="btn-secondary" id="btnReloadStatus">🔎 상태 새로고침</button>
+      </div>
+      <div class="alert alert-error" id="serverErrorAlert"></div>
+      <div class="alert alert-success" id="serverSuccessAlert"></div>
+    </div>
+
+    <!-- Main Extractor Card -->
     <div class="card">
       <label for="rawInput">📋 재니터 요청 헤더-쿠키(Request Headers - Cookie) 값 붙여넣기:</label>
-      <textarea id="rawInput" placeholder="재니터 개발자 도구(F12) -> Network -> Headers -> Request Headers 에서 복사한 'Cookie:' 뒷부분 내용을 여기에 붙여넣으세요..."></textarea>
-      
+      <textarea id="rawInput" placeholder="재니터 개발자 도구(F12) -> Network -> Headers -> Request Headers 에서 복사한 'Cookie:' 뒷부분(또는 헤더 전체 / sb-auth-auth-token 값)을 붙여넣으세요..."></textarea>
+
       <div class="btn-row">
         <button class="btn-primary" id="btnExtract">🔑 토큰 추출하기</button>
         <button class="btn-secondary" id="btnClear">🧹 지우기</button>
       </div>
 
       <div class="alert alert-error" id="errorAlert"></div>
+      <div class="alert alert-success" id="saveSuccessAlert"></div>
 
       <!-- Result Section -->
       <div class="result-section" id="resultSection">
@@ -269,6 +393,7 @@
         </div>
 
         <div class="btn-row" style="margin-top: 14px;">
+          <button class="btn-success server-only" id="btnSaveServer">💾 실리태번에 바로 저장</button>
           <button class="btn-success" id="btnCopyJson">📋 token.json 내용 복사</button>
           <button class="btn-secondary" id="btnDownloadJson">💾 token.json 파일 다운로드</button>
         </div>
@@ -282,125 +407,370 @@
         <li>PC 브라우저(크롬/엣지)에서 [janitorai.com]에 로그인합니다.</li>
         <li>키보드의 <code>F12</code> 키를 눌러 개발자 도구를 열고 상단의 <code>Network</code> 탭을 클릭합니다.</li>
         <li>화면에서 아무 캐릭터나 클릭하거나 <code>F5</code>로 새로고침합니다.</li>
-        <li>네트워크 목록의 요청 중 하나(예: <code>characters</code>, <code>hampter</code>, <code>me</code> 등)를 클릭합니다.</li>
-        <li>우측 창의 <code>Headers</code> -> <code>Request Headers</code> 목록에서 <code>Cookie:</code> 뒷부분(또는 Request Headers 전체)을 복사하여 위 입력창에 넣고 <strong>[토큰 추출하기]</strong>를 누르면 끝!</li>
+        <li>네트워크 목록에서 <code>3f8a1c4d-e729-40b2-9156-...</code> 처럼 알파벳·숫자·대시(<code>-</code>) 조합으로 생긴 UUID 형태의 요청을 클릭합니다.</li>
+        <li>우측 창의 <code>Headers</code> -&gt; <code>Request Headers</code> 목록에서 <code>Cookie:</code> 뒷부분(또는 Request Headers 전체)을 복사하여 위 입력창에 넣고 <strong>[토큰 추출하기]</strong>를 누르면 끝!</li>
       </ol>
       <p style="margin-top: 10px; font-size: 0.8rem; color: #6ee7b7;">
-        🔒 <strong>로컬 보안 보장:</strong> 모든 추출 작업은 귀하의 브라우저 로컬 안에서만 100% 실행되며, 인터넷이나 외부 서버로 토큰이 절대 전송되지 않습니다.
+        🔒 <strong>로컬 보안 보장:</strong> 모든 추출 작업은 사용자 PC 안에서만 100% 로컬 처리되며, 외부 서버로 토큰이 절대 전송되지 않습니다.
       </p>
     </div>
   </div>
 
   <script>
+    function safeDecodePercent(str) {
+      if (typeof str !== 'string' || !str.includes('%')) return str || '';
+      try {
+        return decodeURIComponent(str);
+      } catch {
+        return str.replace(/%[0-9A-Fa-f]{2}/g, (m) => {
+          try {
+            return decodeURIComponent(m);
+          } catch {
+            return m;
+          }
+        });
+      }
+    }
+
+    function stripOuterQuotes(str) {
+      const s = String(str || '').trim();
+      if (s.length >= 2 && ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'")))) {
+        return s.slice(1, -1).trim();
+      }
+      return s;
+    }
+
+    function safeBase64Decode(rawB64) {
+      if (!rawB64 || typeof rawB64 !== 'string') return '';
+      let b64 = stripOuterQuotes(safeDecodePercent(rawB64)).trim();
+      if (b64.startsWith('base64-')) b64 = b64.slice(7);
+      b64 = b64.replace(/\s+/g, '').replace(/-/g, '+').replace(/_/g, '/');
+      if (b64.length % 4 === 1) b64 = b64.slice(0, -1);
+      while (b64.length % 4 !== 0) b64 += '=';
+      try {
+        const bin = atob(b64);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) {
+          bytes[i] = bin.charCodeAt(i);
+        }
+        return new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+      } catch {
+        return '';
+      }
+    }
+
+    function isSupabaseAnonJwt(jwt) {
+      if (typeof jwt !== 'string') return false;
+      const parts = jwt.split('.');
+      if (parts.length !== 3) return false;
+      try {
+        const payload = JSON.parse(safeBase64Decode(parts[1]));
+        return payload && payload.role === 'anon';
+      } catch {
+        return false;
+      }
+    }
+
     function parseTokens(raw) {
       if (!raw || typeof raw !== 'string') return null;
 
       let accessToken = '';
       let refreshToken = '';
 
-      // Step 0: URL-decode if input contains %
-      let cleanRaw = raw;
-      try {
-        if (cleanRaw.includes('%')) {
-          cleanRaw = decodeURIComponent(cleanRaw);
-        }
-      } catch (e) {}
-
-      // Helper: Safe base64 decoding that handles URL-safe characters & split chunks
-      function safeBase64Decode(b64) {
-        if (!b64) return '';
-        b64 = b64.trim();
-        if (b64.startsWith('base64-')) b64 = b64.slice(7);
-        b64 = b64.replace(/-/g, '+').replace(/_/g, '/');
-        if (b64.length % 4 === 1) b64 = b64.slice(0, -1);
-        while (b64.length % 4 !== 0) b64 += '=';
-        try {
-          return atob(b64);
-        } catch (e) {
-          return '';
-        }
-      }
-
-      // Helper: Extract tokens from decoded text or JSON
       function extractFromText(text) {
-        if (!text) return;
-        if (!accessToken) {
-          const mAcc = text.match(/"access_token"\s*:\s*"([^"]+)"/);
-          if (mAcc) accessToken = mAcc[1];
+        if (!text || typeof text !== 'string') return;
+        const candidates = [text];
+        if (text.includes('\\"')) candidates.push(text.replace(/\\"/g, '"'));
+        if (text.includes('%')) candidates.push(safeDecodePercent(text));
+        if (text.includes('%') && text.includes('\\"')) {
+          candidates.push(safeDecodePercent(text).replace(/\\"/g, '"'));
         }
-        if (!refreshToken) {
-          const mRef = text.match(/"refresh_token"\s*:\s*"([^"]+)"/);
-          if (mRef) refreshToken = mRef[1];
-        }
-      }
 
-      // 1. Supabase cookie chunking parser (sb-auth-auth-token.0, sb-auth-auth-token.1 ...)
-      const chunkRegex = /sb-auth-auth-token(?:\.(\d+))?=([^; \r\n"']+)/g;
-      let chunks = [];
-      let match;
-      while ((match = chunkRegex.exec(cleanRaw)) !== null) {
-        chunks.push({ idx: match[1] !== undefined ? parseInt(match[1], 10) : 0, val: match[2].trim() });
-      }
-
-      if (chunks.length > 0) {
-        chunks.sort((a, b) => a.idx - b.idx);
-
-        // Strategy A: Combine all chunks in order
-        const combinedVal = chunks.map(c => {
-          let s = c.val;
-          if (s.startsWith('base64-')) s = s.slice(7);
-          return s;
-        }).join('');
-        const decCombined = safeBase64Decode(combinedVal);
-        extractFromText(decCombined);
-
-        // Strategy B: If still missing, decode each chunk individually with safe trim
-        if (!accessToken || !refreshToken) {
-          for (const c of chunks) {
-            const dec = safeBase64Decode(c.val);
-            extractFromText(dec);
+        for (const t of candidates) {
+          if (!accessToken) {
+            const mAcc = t.match(/["']?(?:access_token|janitor_key)["']?\s*[:=]\s*["']?([A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)["']?/);
+            if (mAcc && !isSupabaseAnonJwt(mAcc[1])) accessToken = mAcc[1];
+          }
+          if (!refreshToken) {
+            const mRef = t.match(/["']?(?:refresh_token|janitor_refresh_token)["']?\s*[:=]\s*["']?([A-Za-z0-9._~+/-]{6,})["']?/);
+            if (mRef) refreshToken = mRef[1];
           }
         }
       }
 
-      // 2. Direct Bearer JWT pattern (access_token) anywhere in input
+      // 1. Parse Supabase chunked/single auth cookies from original AND percent-decoded variants
+      //    Supports sb-auth-auth-token(.0) and generic sb-<projectRef>-auth-token(.0), quoted or unquoted.
+      const chunkGroups = new Map();
+      const cookieRegex = /(?:^|[;\s,:])(sb-[a-z0-9_-]*auth-token)(?:\.(\d+))?\s*=\s*("[^"\r\n]+"|'[^'\r\n]+'|[^;\s\r\n]+)/gi;
+
+      const scanCookieSource = (src) => {
+        let match;
+        cookieRegex.lastIndex = 0;
+        while ((match = cookieRegex.exec(src)) !== null) {
+          const baseName = match[1].toLowerCase();
+          const idx = match[2] !== undefined ? parseInt(match[2], 10) : 0;
+          const val = stripOuterQuotes(safeDecodePercent(match[3]));
+          if (!chunkGroups.has(baseName)) chunkGroups.set(baseName, new Map());
+          if (!chunkGroups.get(baseName).has(idx)) {
+            chunkGroups.get(baseName).set(idx, val);
+          }
+        }
+      };
+
+      scanCookieSource(raw);
+      if (raw.includes('%')) {
+        scanCookieSource(safeDecodePercent(raw));
+      }
+
+      for (const groupMap of chunkGroups.values()) {
+        const chunks = Array.from(groupMap.entries())
+          .sort((a, b) => a[0] - b[0])
+          .map(([, val]) => val);
+
+        // Strategy A: Join chunk values sequentially (strip base64- prefix cleanly)
+        const combinedRaw = chunks.map((v, i) => {
+          if (i === 0 && v.startsWith('base64-')) return v.slice(7);
+          return v.startsWith('base64-') ? v.slice(7) : v;
+        }).join('');
+
+        if (combinedRaw.trim().startsWith('{')) {
+          extractFromText(combinedRaw);
+        }
+        if (!accessToken || !refreshToken) {
+          extractFromText(safeBase64Decode(combinedRaw));
+        }
+
+        // Strategy B: Decode each chunk individually as fallback for incomplete pastes
+        if (!accessToken || !refreshToken) {
+          for (const val of chunks) {
+            if (val.includes('access_token') || val.includes('refresh_token')) {
+              extractFromText(val);
+            }
+            extractFromText(safeBase64Decode(val));
+          }
+        }
+      }
+
+      // 2. Direct JSON / key=value / escaped JSON extraction across raw & normalized forms
+      extractFromText(raw);
+
+      // 3. Direct JWT fallback (filtering out Supabase public anon keys)
       if (!accessToken) {
-        const jwtMatch = cleanRaw.match(/eyJhbGciOi[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/);
-        if (jwtMatch) accessToken = jwtMatch[0];
+        const jwtRe = /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g;
+        for (const text of [raw, safeDecodePercent(raw)]) {
+          let m;
+          while ((m = jwtRe.exec(text)) !== null) {
+            if (!isSupabaseAnonJwt(m[0])) {
+              accessToken = m[0];
+              break;
+            }
+          }
+          if (accessToken) break;
+        }
       }
 
-      // 3. Direct refresh_token regex in raw text
-      if (!refreshToken) {
-        const rfMatch = cleanRaw.match(/["']?refresh_token["']?\s*[:=]\s*["']?([a-zA-Z0-9_-]{8,})["']?/);
-        if (rfMatch) refreshToken = rfMatch[1];
+      // 4. Direct JSON object fallback
+      for (const candidate of [raw.trim(), safeDecodePercent(raw.trim()), safeDecodePercent(raw.trim()).replace(/\\"/g, '"')]) {
+        if (accessToken && refreshToken) break;
+        try {
+          const parsed = JSON.parse(candidate);
+          if (parsed && typeof parsed === 'object') {
+            if (!accessToken) {
+              const t = parsed.access_token || parsed.janitor_key || parsed.token;
+              if (typeof t === 'string' && !isSupabaseAnonJwt(t)) accessToken = t;
+            }
+            if (!refreshToken) {
+              const r = parsed.refresh_token || parsed.janitor_refresh_token;
+              if (typeof r === 'string') refreshToken = r;
+            }
+          }
+        } catch {}
       }
-
-      // 4. Raw JSON fallback
-      try {
-        const parsed = JSON.parse(cleanRaw);
-        if (parsed.access_token && !accessToken) accessToken = parsed.access_token;
-        if (parsed.refresh_token && !refreshToken) refreshToken = parsed.refresh_token;
-      } catch (e) {}
 
       return {
-        accessToken: (accessToken || '').trim(),
-        refreshToken: (refreshToken || '').trim()
+        accessToken: String(accessToken || '').trim(),
+        refreshToken: String(refreshToken || '').trim(),
       };
+    }
+
+    function copyTextToClipboard(text) {
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        return navigator.clipboard.writeText(text).catch(() => fallbackCopy(text));
+      }
+      return fallbackCopy(text);
+    }
+
+    function fallbackCopy(text) {
+      return new Promise((resolve, reject) => {
+        try {
+          const ta = document.createElement('textarea');
+          ta.value = text;
+          ta.setAttribute('readonly', '');
+          ta.style.position = 'fixed';
+          ta.style.left = '-9999px';
+          document.body.appendChild(ta);
+          ta.select();
+          const ok = document.execCommand('copy');
+          document.body.removeChild(ta);
+          if (ok) resolve();
+          else reject(new Error('Clipboard copy failed'));
+        } catch (err) {
+          reject(err);
+        }
+      });
     }
 
     const rawInput = document.getElementById('rawInput');
     const btnExtract = document.getElementById('btnExtract');
     const btnClear = document.getElementById('btnClear');
     const errorAlert = document.getElementById('errorAlert');
+    const saveSuccessAlert = document.getElementById('saveSuccessAlert');
     const resultSection = document.getElementById('resultSection');
     const outRefreshToken = document.getElementById('outRefreshToken');
     const outJanitorKey = document.getElementById('outJanitorKey');
     const jsonPreview = document.getElementById('jsonPreview');
     const btnCopyJson = document.getElementById('btnCopyJson');
     const btnDownloadJson = document.getElementById('btnDownloadJson');
+    const btnSaveServer = document.getElementById('btnSaveServer');
+
+    const PLUGIN_API_BASE = '/api/plugins/silly-cloudfix';
+    const isServerHosted = typeof window !== 'undefined' &&
+      (window.location.protocol === 'http:' || window.location.protocol === 'https:') &&
+      window.location.pathname.includes('/api/plugins/silly-cloudfix');
+
+    async function getCsrfHeaders() {
+      try {
+        const res = await fetch('/csrf-token');
+        if (!res.ok) return {};
+        const data = await res.json();
+        if (data?.token && data.token !== 'disabled') {
+          return { 'X-CSRF-Token': data.token };
+        }
+      } catch {}
+      return {};
+    }
+
+    function renderServerStatus(data) {
+      const badge = document.getElementById('statusBadge');
+      const stInterceptor = document.getElementById('stInterceptor');
+      const stSource = document.getElementById('stSource');
+      const stExpiry = document.getElementById('stExpiry');
+      const stRefresh = document.getElementById('stRefresh');
+      const serverErr = document.getElementById('serverErrorAlert');
+      const ts = data?.tokenStatus || {};
+
+      stInterceptor.textContent = data?.interceptorInstalled ? '활성 (정상)' : '미설치';
+      const sourceLabels = { file: 'token.json', env: '환경변수 (ENV)', none: '미설정' };
+      stSource.textContent = sourceLabels[ts.source] || ts.source || '-';
+      stRefresh.textContent = ts.hasRefreshToken ? '등록됨' : '없음';
+
+      if (!ts.hasAccessToken) {
+        stExpiry.textContent = ts.hasRefreshToken ? '자동 갱신 대기' : '토큰 없음';
+      } else if (ts.isExpired) {
+        stExpiry.textContent = ts.hasRefreshToken ? '만료됨 (요청 시 자동 갱신)' : '만료됨 (재등록 필요)';
+      } else if (ts.expiresInSeconds !== null) {
+        const mins = Math.floor(ts.expiresInSeconds / 60);
+        stExpiry.textContent = `${mins}분 남음`;
+      } else {
+        stExpiry.textContent = '알 수 없음';
+      }
+
+      if (!data?.interceptorInstalled) {
+        badge.className = 'badge badge-err';
+        badge.textContent = '인터셉터 비활성';
+      } else if (ts.configured && (!ts.isExpired || ts.hasRefreshToken)) {
+        badge.className = 'badge badge-ok';
+        badge.textContent = '정상 작동 중';
+      } else {
+        badge.className = 'badge badge-warn';
+        badge.textContent = '토큰 등록 필요';
+      }
+
+      if (ts.lastError?.message) {
+        serverErr.textContent = `최근 오류 (${ts.lastError.context}): ${ts.lastError.message}`;
+        serverErr.style.display = 'block';
+      } else {
+        serverErr.style.display = 'none';
+      }
+    }
+
+    async function loadServerStatus() {
+      const serverErr = document.getElementById('serverErrorAlert');
+      try {
+        const res = await fetch(`${PLUGIN_API_BASE}/status`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        renderServerStatus(data);
+      } catch (err) {
+        serverErr.textContent = `상태 조회 실패: ${err.message}`;
+        serverErr.style.display = 'block';
+      }
+    }
+
+    if (isServerHosted) {
+      const redirectHint = document.getElementById('serverRedirectHint');
+      if (redirectHint) redirectHint.style.display = 'none';
+      document.getElementById('serverPanel').style.display = 'block';
+      btnSaveServer.style.display = 'inline-flex';
+      loadServerStatus();
+
+      document.getElementById('btnReloadStatus').addEventListener('click', loadServerStatus);
+      document.getElementById('btnServerRefresh').addEventListener('click', async () => {
+        const btn = document.getElementById('btnServerRefresh');
+        const serverErr = document.getElementById('serverErrorAlert');
+        const serverOk = document.getElementById('serverSuccessAlert');
+        serverErr.style.display = 'none';
+        serverOk.style.display = 'none';
+        btn.disabled = true;
+        try {
+          const headers = { 'Content-Type': 'application/json', ...(await getCsrfHeaders()) };
+          const res = await fetch(`${PLUGIN_API_BASE}/refresh`, { method: 'POST', headers });
+          const data = await res.json();
+          if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+          renderServerStatus({ interceptorInstalled: true, tokenStatus: data.tokenStatus });
+          serverOk.textContent = '✅ 토큰이 정상 갱신되어 token.json에 저장되었습니다.';
+          serverOk.style.display = 'block';
+        } catch (err) {
+          serverErr.textContent = `토큰 갱신 실패: ${err.message}`;
+          serverErr.style.display = 'block';
+        } finally {
+          btn.disabled = false;
+        }
+      });
+
+      btnSaveServer.addEventListener('click', async () => {
+        errorAlert.style.display = 'none';
+        saveSuccessAlert.style.display = 'none';
+        btnSaveServer.disabled = true;
+        try {
+          const headers = { 'Content-Type': 'application/json', ...(await getCsrfHeaders()) };
+          const res = await fetch(`${PLUGIN_API_BASE}/token`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+              janitor_refresh_token: outRefreshToken.value,
+              janitor_key: outJanitorKey.value,
+            }),
+          });
+          const data = await res.json();
+          if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+          saveSuccessAlert.textContent = data.warning
+            ? `✅ 저장되었습니다 (참고: 자동 갱신 테스트는 건너뜀 - ${data.warning})`
+            : '✅ SillyTavern의 token.json에 즉시 저장되었습니다! 바로 구름 임포트를 사용하실 수 있습니다.';
+          saveSuccessAlert.style.display = 'block';
+          renderServerStatus({ interceptorInstalled: true, tokenStatus: data.tokenStatus });
+        } catch (err) {
+          errorAlert.textContent = `서버 저장 실패: ${err.message}`;
+          errorAlert.style.display = 'block';
+        } finally {
+          btnSaveServer.disabled = false;
+        }
+      });
+    }
 
     btnExtract.addEventListener('click', () => {
       errorAlert.style.display = 'none';
+      saveSuccessAlert.style.display = 'none';
       const text = rawInput.value.trim();
       if (!text) {
         errorAlert.textContent = '헤더 또는 Cookie 텍스트를 입력창에 붙여넣어 주세요.';
@@ -410,7 +780,7 @@
 
       const res = parseTokens(text);
       if (!res || (!res.accessToken && !res.refreshToken)) {
-        errorAlert.textContent = '유효한 토큰을 찾지 못했습니다. Request Headers의 Cookie 항목이 맞는지 확인해 주세요.';
+        errorAlert.textContent = '유효한 토큰을 찾지 못했습니다. Request Headers의 Cookie 항목(sb-auth-auth-token)이 맞는지 확인해 주세요.';
         errorAlert.style.display = 'block';
         resultSection.style.display = 'none';
         return;
@@ -421,7 +791,7 @@
 
       const jsonObj = {
         janitor_refresh_token: res.refreshToken,
-        janitor_key: res.accessToken
+        janitor_key: res.accessToken,
       };
       jsonPreview.textContent = JSON.stringify(jsonObj, null, 2);
       resultSection.style.display = 'block';
@@ -431,11 +801,12 @@
       rawInput.value = '';
       resultSection.style.display = 'none';
       errorAlert.style.display = 'none';
+      saveSuccessAlert.style.display = 'none';
     });
 
     function copyField(inputId, msgId) {
       const input = document.getElementById(inputId);
-      navigator.clipboard.writeText(input.value).then(() => {
+      copyTextToClipboard(input.value).then(() => {
         const msg = document.getElementById(msgId);
         msg.classList.add('visible');
         setTimeout(() => msg.classList.remove('visible'), 2000);
@@ -443,7 +814,7 @@
     }
 
     btnCopyJson.addEventListener('click', () => {
-      navigator.clipboard.writeText(jsonPreview.textContent).then(() => {
+      copyTextToClipboard(jsonPreview.textContent).then(() => {
         btnCopyJson.textContent = '✅ 복사 완료!';
         setTimeout(() => {
           btnCopyJson.textContent = '📋 token.json 내용 복사';
@@ -452,7 +823,7 @@
     });
 
     btnDownloadJson.addEventListener('click', () => {
-      const blob = new Blob([jsonPreview.textContent], { type: 'application/json' });
+      const blob = new Blob([jsonPreview.textContent + '\n'], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
@@ -463,4 +834,3 @@
   </script>
 </body>
 </html>
-
