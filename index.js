@@ -363,6 +363,409 @@ function detectCloudflareChallenge(bodyText, statusCode) {
 /**
  * Executes an HTTP GET via curl while preserving exact HTTP status codes and binary safety.
  */
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const APNG_ONLY_CHUNKS = new Set(['acTL', 'fcTL', 'fdAT']);
+const MAX_AVATAR_ATTEMPTS_PER_URL = 3;
+const AVATAR_RETRY_BASE_MS = 350;
+const AVATAR_REQUEST_HEADERS = {
+    Accept: 'image/avif,image/webp,image/png,image/jpeg,*/*;q=0.8',
+    Referer: 'https://janitorai.com/',
+    Origin: 'https://janitorai.com',
+};
+
+const PNG_CRC32_TABLE = (() => {
+    const table = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+        let c = n;
+        for (let k = 0; k < 8; k++) {
+            c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+        }
+        table[n] = c >>> 0;
+    }
+    return table;
+})();
+
+function crc32Bytes(buf) {
+    let c = 0xffffffff;
+    for (let i = 0; i < buf.length; i++) {
+        c = PNG_CRC32_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+    }
+    return (c ^ 0xffffffff) >>> 0;
+}
+
+function defaultSleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const uuidDownloadQueues = new Map();
+
+/**
+ * Serializes concurrent async tasks sharing the same key without suppressing distinct sequential calls.
+ * @param {string} queueKey Identifier to serialize on (e.g. character UUID).
+ * @param {() => Promise<any>} taskFn Async work to run exclusively for queueKey.
+ */
+export async function runWithUuidQueue(queueKey, taskFn) {
+    const key = String(queueKey || '').trim();
+    if (!key) return await taskFn();
+    const prev = uuidDownloadQueues.get(key) || Promise.resolve();
+    const next = prev.catch(() => {}).then(() => taskFn());
+    uuidDownloadQueues.set(key, next);
+    try {
+        return await next;
+    } finally {
+        if (uuidDownloadQueues.get(key) === next) {
+            uuidDownloadQueues.delete(key);
+        }
+    }
+}
+
+function normalizeRawAvatarUrl(rawValue) {
+    if (typeof rawValue !== 'string') return '';
+    const trimmed = rawValue.trim();
+    if (!trimmed) return '';
+    const lower = trimmed.toLowerCase();
+    if (lower === 'none' || lower === 'null' || lower === 'undefined') return '';
+
+    if (/^https?:\/\//i.test(trimmed)) return trimmed;
+    if (trimmed.startsWith('//')) return `https:${trimmed}`;
+    if (trimmed.startsWith('/')) return `https://ella.janitorai.com${trimmed}`;
+    if (/^bot-avatars\//i.test(trimmed)) return `https://ella.janitorai.com/${trimmed}`;
+    return `https://ella.janitorai.com/bot-avatars/${trimmed}`;
+}
+
+/**
+ * Builds ordered, deduplicated avatar candidate URLs (with width=1200 first and raw CDN fallback second).
+ * @param {object} char JanitorAI character metadata object.
+ * @returns {string[]} Ordered unique candidate URLs (empty only when character has no avatar).
+ */
+export function buildAvatarCandidateUrls(char) {
+    const rawValues = [char?.avatar, char?.raw_avatar, char?.avatar_url];
+    const candidates = [];
+    const seen = new Set();
+
+    const pushUnique = (u) => {
+        if (u && !seen.has(u)) {
+            seen.add(u);
+            candidates.push(u);
+        }
+    };
+
+    for (const rawVal of rawValues) {
+        const normalized = normalizeRawAvatarUrl(rawVal);
+        if (!normalized) continue;
+        try {
+            const parsed = new URL(normalized);
+            if (parsed.hostname.endsWith('janitorai.com')) {
+                if (!parsed.searchParams.has('width')) {
+                    const resized = new URL(parsed.toString());
+                    resized.searchParams.set('width', '1200');
+                    pushUnique(resized.toString());
+                } else {
+                    pushUnique(parsed.toString());
+                }
+                const unresized = new URL(parsed.toString());
+                unresized.searchParams.delete('width');
+                pushUnique(unresized.toString());
+            } else {
+                pushUnique(parsed.toString());
+            }
+        } catch {
+            pushUnique(normalized);
+        }
+    }
+
+    return candidates;
+}
+
+function extractTextKeyword(chunkData) {
+    const nulIdx = chunkData.indexOf(0);
+    if (nulIdx === -1) return '';
+    return chunkData.subarray(0, nulIdx).toString('latin1').trim().toLowerCase();
+}
+
+/**
+ * Validates that a JPEG byte buffer contains intact segment headers and ends after a valid
+ * Start-of-Scan (SOS) with an End-of-Image (EOI, 0xFFD9) marker, preventing Jimp's WASM decoder
+ * from silently filling truncated JPEGs with gray pixels.
+ * @param {Buffer} buf
+ */
+export function assertCompleteJpegBuffer(buf) {
+    if (buf.length < 4 || buf[0] !== 0xff || buf[1] !== 0xd8 || buf[2] !== 0xff) {
+        throw new Error('Malformed JPEG header');
+    }
+
+    let pos = 2;
+    let sawSos = false;
+
+    while (pos < buf.length) {
+        while (pos < buf.length && buf[pos] === 0xff) {
+            pos++;
+        }
+        if (pos >= buf.length) {
+            throw new Error('Truncated JPEG marker at end of stream');
+        }
+
+        const marker = buf[pos++];
+        if (marker === 0x00) {
+            throw new Error('Invalid JPEG marker structure');
+        }
+        if (marker === 0xd9) {
+            if (!sawSos) {
+                throw new Error('Incomplete JPEG image: EOI appeared before image scan data');
+            }
+            return;
+        }
+        if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7) || marker === 0xd8) {
+            continue;
+        }
+
+        if (pos + 2 > buf.length) {
+            throw new Error(`Truncated JPEG segment header for marker 0xFF${marker.toString(16).toUpperCase()}`);
+        }
+        const segLen = buf.readUInt16BE(pos);
+        if (segLen < 2 || pos + segLen > buf.length) {
+            throw new Error(`Truncated JPEG segment payload for marker 0xFF${marker.toString(16).toUpperCase()}`);
+        }
+        pos += segLen;
+
+        if (marker === 0xda) {
+            if (segLen < 6) {
+                throw new Error('Invalid JPEG Start-of-Scan segment');
+            }
+            sawSos = true;
+            while (pos < buf.length) {
+                const ffIdx = buf.indexOf(0xff, pos);
+                if (ffIdx === -1) {
+                    throw new Error('Truncated JPEG bitstream: missing EOI marker');
+                }
+                if (ffIdx + 1 >= buf.length) {
+                    throw new Error('Truncated JPEG bitstream at marker prefix');
+                }
+                const nextByte = buf[ffIdx + 1];
+                if (nextByte === 0x00 || (nextByte >= 0xd0 && nextByte <= 0xd7)) {
+                    pos = ffIdx + 2;
+                    continue;
+                }
+                if (nextByte === 0xff) {
+                    pos = ffIdx + 1;
+                    continue;
+                }
+                pos = ffIdx;
+                break;
+            }
+        }
+    }
+
+    throw new Error('Incomplete JPEG image: missing EOI marker');
+}
+
+/**
+ * Validates that a WebP RIFF container declares no more bytes than actually downloaded.
+ * @param {Buffer} buf
+ */
+export function assertCompleteWebpBuffer(buf) {
+    if (
+        buf.length >= 12 &&
+        buf.subarray(0, 4).toString('ascii') === 'RIFF' &&
+        buf.subarray(8, 12).toString('ascii') === 'WEBP'
+    ) {
+        const riffSize = buf.readUInt32LE(4);
+        if (riffSize < 4 || 8 + riffSize > buf.length) {
+            throw new Error('Truncated WebP RIFF container');
+        }
+    }
+}
+
+/**
+ * Validates downloaded avatar bytes, strips APNG animation / stale card metadata chunks,
+ * confirms pixel decodability with Jimp, and returns a clean static PNG buffer.
+ * @param {Buffer} imgBytes Raw downloaded image bytes.
+ * @returns {Promise<Buffer>} Validated static PNG buffer.
+ */
+export async function ensureValidAvatarPng(imgBytes) {
+    if (!Buffer.isBuffer(imgBytes) || imgBytes.length < 16) {
+        throw new Error('Avatar download returned empty or too-small buffer');
+    }
+
+    const headText = imgBytes.subarray(0, 256).toString('utf8').trimStart().toLowerCase();
+    if (
+        headText.startsWith('<!doctype') ||
+        headText.startsWith('<html') ||
+        headText.startsWith('<svg') ||
+        headText.startsWith('<?xml') ||
+        headText.startsWith('{') ||
+        headText.startsWith('[')
+    ) {
+        throw new Error('Avatar response returned text/HTML/JSON instead of binary image data');
+    }
+
+    const isPng = imgBytes.length >= 8 && imgBytes.subarray(0, 8).equals(PNG_SIGNATURE);
+    let bufferForDecode = imgBytes;
+    let mustReencodePng = !isPng;
+
+    if (!isPng) {
+        if (imgBytes[0] === 0xff && imgBytes[1] === 0xd8) {
+            assertCompleteJpegBuffer(imgBytes);
+        } else {
+            assertCompleteWebpBuffer(imgBytes);
+        }
+    }
+
+    if (isPng) {
+        let pos = 8;
+        let sawIHDR = false;
+        let idatCount = 0;
+        let sawIEND = false;
+        let hasApngChunks = false;
+        let hasEmbeddedCardText = false;
+        const staticChunks = [PNG_SIGNATURE];
+
+        while (pos + 12 <= imgBytes.length) {
+            const len = imgBytes.readUInt32BE(pos);
+            const totalLen = 12 + len;
+            if (len > 0x7fffffff || pos + totalLen > imgBytes.length) {
+                throw new Error(`Truncated PNG chunk at offset ${pos}`);
+            }
+
+            const typeBytes = imgBytes.subarray(pos + 4, pos + 8);
+            const type = typeBytes.toString('ascii');
+            if (!/^[A-Za-z]{4}$/.test(type)) {
+                throw new Error(`Invalid PNG chunk type at offset ${pos}`);
+            }
+
+            const expectedCrc = imgBytes.readUInt32BE(pos + 8 + len);
+            const actualCrc = crc32Bytes(imgBytes.subarray(pos + 4, pos + 8 + len));
+            if (expectedCrc !== actualCrc) {
+                throw new Error(`Corrupt PNG chunk CRC in ${type}`);
+            }
+
+            const chunkData = imgBytes.subarray(pos + 8, pos + 8 + len);
+            if (pos === 8) {
+                if (type !== 'IHDR' || len !== 13) {
+                    throw new Error('Invalid PNG header: missing or malformed IHDR chunk');
+                }
+                const w = chunkData.readUInt32BE(0);
+                const h = chunkData.readUInt32BE(4);
+                if (!w || !h) {
+                    throw new Error('Invalid PNG dimensions in IHDR');
+                }
+                sawIHDR = true;
+            } else if (type === 'IDAT') {
+                idatCount++;
+            }
+
+            if (APNG_ONLY_CHUNKS.has(type)) {
+                hasApngChunks = true;
+                mustReencodePng = true;
+            } else if (type === 'tEXt' || type === 'zTXt' || type === 'iTXt') {
+                const kw = extractTextKeyword(chunkData);
+                if (kw === 'chara' || kw === 'ccv3') {
+                    hasEmbeddedCardText = true;
+                    mustReencodePng = true;
+                } else {
+                    staticChunks.push(imgBytes.subarray(pos, pos + totalLen));
+                }
+            } else {
+                staticChunks.push(imgBytes.subarray(pos, pos + totalLen));
+            }
+
+            pos += totalLen;
+            if (type === 'IEND') {
+                sawIEND = true;
+                break;
+            }
+        }
+
+        if (!sawIHDR || idatCount === 0 || !sawIEND) {
+            throw new Error('Incomplete PNG image: missing IHDR, IDAT, or IEND chunk');
+        }
+
+        if (hasApngChunks || hasEmbeddedCardText) {
+            bufferForDecode = Buffer.concat(staticChunks);
+        }
+    }
+
+    const jimpImg = typeof Jimp.fromBuffer === 'function'
+        ? await Jimp.fromBuffer(bufferForDecode)
+        : await Jimp.read(bufferForDecode);
+    const width = jimpImg?.width ?? jimpImg?.bitmap?.width ?? 0;
+    const height = jimpImg?.height ?? jimpImg?.bitmap?.height ?? 0;
+    if (!width || !height) {
+        throw new Error('Decoded avatar image has invalid zero dimensions');
+    }
+
+    if (!mustReencodePng) {
+        return imgBytes;
+    }
+
+    const encodedPng = await jimpImg.getBuffer(JimpMime.png);
+    if (!Buffer.isBuffer(encodedPng) || encodedPng.length < 8 || !encodedPng.subarray(0, 8).equals(PNG_SIGNATURE)) {
+        throw new Error('Jimp PNG re-encoding produced an invalid PNG buffer');
+    }
+    return encodedPng;
+}
+
+function isRetryableAvatarError(err) {
+    if (!err) return true;
+    const status = Number(err.status) || 0;
+    if (status === 404 || status === 410 || status === 400) return false;
+    return status === 0 || status === 408 || status === 429 || status >= 500 || !('status' in err);
+}
+
+/**
+ * Downloads and validates the character avatar PNG from JanitorAI CDN with retries and raw fallback.
+ * Never silently replaces a configured avatar with the default avatar behind HTTP 200.
+ * @param {object} char JanitorAI character payload.
+ * @param {object} [opts] Optional dependency overrides for testing.
+ * @returns {Promise<{ pngBuffer: Buffer, usedDefaultAvatar: boolean, sourceUrl: string }>}
+ */
+export async function downloadCharacterAvatarPng(
+    char,
+    {
+        fetchBinary = (targetUrl) => curlRequest(targetUrl, {
+            binary: true,
+            headers: AVATAR_REQUEST_HEADERS,
+            timeoutSec: 60,
+            maxBuffer: 25 * 1024 * 1024,
+        }),
+        defaultAvatarPath = resolveDefaultAvatarPath(),
+        sleep = defaultSleep,
+    } = {},
+) {
+    const candidates = buildAvatarCandidateUrls(char);
+    if (candidates.length === 0) {
+        const defaultBuffer = await fs.promises.readFile(defaultAvatarPath);
+        const pngBuffer = await ensureValidAvatarPng(defaultBuffer);
+        return { pngBuffer, usedDefaultAvatar: true, sourceUrl: '' };
+    }
+
+    let lastErr = null;
+    for (const candidateUrl of candidates) {
+        for (let attempt = 1; attempt <= MAX_AVATAR_ATTEMPTS_PER_URL; attempt++) {
+            try {
+                const { buffer: imgBytes } = await fetchBinary(candidateUrl);
+                const pngBuffer = await ensureValidAvatarPng(imgBytes);
+                return { pngBuffer, usedDefaultAvatar: false, sourceUrl: candidateUrl };
+            } catch (err) {
+                lastErr = err;
+                const canRetry = attempt < MAX_AVATAR_ATTEMPTS_PER_URL && isRetryableAvatarError(err);
+                console.warn(
+                    `[Silly-CloudFix] Avatar attempt ${attempt}/${MAX_AVATAR_ATTEMPTS_PER_URL} failed for ${candidateUrl}: ${err.message}`,
+                );
+                if (!canRetry) break;
+                const delayMs = AVATAR_RETRY_BASE_MS * (2 ** (attempt - 1));
+                await sleep(delayMs);
+            }
+        }
+    }
+
+    throw new JanitorHttpError(
+        502,
+        `Failed to download or decode avatar for "${char?.name || 'character'}": ${lastErr?.message || 'unknown error'}`,
+        { statusText: 'Failed to download JanitorAI character avatar' },
+    );
+}
+
 async function curlRequest(url, { headers = {}, binary = false, timeoutSec = 45, maxBuffer = 15 * 1024 * 1024 } = {}) {
     const args = [
         '-sS',
@@ -400,9 +803,9 @@ async function curlRequest(url, { headers = {}, binary = false, timeoutSec = 45,
     }
 
     if (binary) {
-        if (statusCode >= 400) {
-            throw new JanitorHttpError(statusCode, `Binary fetch returned HTTP ${statusCode} for ${url}`, {
-                statusText: `Upstream returned HTTP ${statusCode}`,
+        if (statusCode < 200 || statusCode >= 300 || statusCode === 204 || statusCode === 206) {
+            throw new JanitorHttpError(statusCode || 502, `Binary fetch returned HTTP ${statusCode} for ${url}`, {
+                statusText: statusCode ? `Upstream returned HTTP ${statusCode}` : 'Upstream binary connection returned no HTTP status',
             });
         }
         return { status: statusCode, buffer: bodyBuf };
@@ -429,7 +832,7 @@ async function curlRequest(url, { headers = {}, binary = false, timeoutSec = 45,
         });
     }
 
-    if (statusCode >= 400 || statusCode === 0) {
+    if (statusCode >= 400 || statusCode === 0 || statusCode === 204 || statusCode === 206) {
         throw new JanitorHttpError(statusCode || 502, `Janitor upstream error HTTP ${statusCode}`, {
             statusText: `Janitor upstream HTTP ${statusCode || 'error'}`,
         });
@@ -441,7 +844,7 @@ async function curlRequest(url, { headers = {}, binary = false, timeoutSec = 45,
 /**
  * Fetches JSON from JanitorAI APIs, automatically retrying once with a forced token refresh on HTTP 401.
  */
-async function fetchJanitorJson(url, { allowRefreshRetry = true } = {}) {
+async function fetchJanitorJson(url, { allowRefreshRetry = true, timeoutSec = 45, maxBuffer = 15 * 1024 * 1024 } = {}) {
     let janitorToken = await getJanitorToken();
 
     const makeHeaders = (token) => ({
@@ -453,7 +856,7 @@ async function fetchJanitorJson(url, { allowRefreshRetry = true } = {}) {
 
     let res;
     try {
-        res = await curlRequest(url, { headers: makeHeaders(janitorToken) });
+        res = await curlRequest(url, { headers: makeHeaders(janitorToken), timeoutSec, maxBuffer });
     } catch (err) {
         if (err instanceof JanitorHttpError && err.status === 401 && allowRefreshRetry) {
             const { refreshToken } = resolveTokenCandidate(TOKEN_FILE_PATH);
@@ -461,7 +864,7 @@ async function fetchJanitorJson(url, { allowRefreshRetry = true } = {}) {
                 console.warn('[Silly-CloudFix] Janitor API returned HTTP 401; forcing token refresh and retrying once...');
                 janitorToken = await getJanitorToken({ forceRefresh: true });
                 if (janitorToken) {
-                    res = await curlRequest(url, { headers: makeHeaders(janitorToken) });
+                    res = await curlRequest(url, { headers: makeHeaders(janitorToken), timeoutSec, maxBuffer });
                 } else {
                     throw err;
                 }
@@ -705,6 +1108,149 @@ export function resolveUniqueWorldTarget(baseWorldName, worldsDir, reservedNames
     }
 }
 
+/**
+ * Returns true only when an optional JanitorAI sub-endpoint (chat preview or creator script list)
+ * is legitimately absent/private (non-Cloudflare 403/404), and false for auth, rate-limit,
+ * Cloudflare, or upstream/network errors that must abort an incomplete import.
+ * @param {unknown} err
+ * @returns {boolean}
+ */
+export function isBenignOptionalEndpointError(err) {
+    return Boolean(
+        err instanceof JanitorHttpError &&
+        !err.isCloudflare &&
+        (err.status === 404 || err.status === 403)
+    );
+}
+
+function hasMeaningfulLoreEntryContent(entry) {
+    if (!entry || typeof entry !== 'object') return false;
+    if (typeof entry.content === 'string' && entry.content.trim()) return true;
+    if (typeof entry.comment === 'string' && entry.comment.trim()) return true;
+    if (typeof entry.name === 'string' && entry.name.trim()) return true;
+    if (Array.isArray(entry.key) && entry.key.some(k => String(k || '').trim())) return true;
+    if (typeof entry.keysRaw === 'string' && entry.keysRaw.trim()) return true;
+    if (Array.isArray(entry.keysecondary) && entry.keysecondary.some(k => String(k || '').trim())) return true;
+    if (typeof entry.keysecondaryRaw === 'string' && entry.keysecondaryRaw.trim()) return true;
+    return false;
+}
+
+/**
+ * Parses and validates a linked JanitorAI lorebook script payload as an atomic whole:
+ * rejects corrupt JSON, non-array schemas, malformed entry items, or count mismatches,
+ * and returns [] for empty/hollow lorebooks so incomplete or empty files are never saved.
+ * @param {unknown} rawScript
+ * @param {string} [loreLabel='lorebook']
+ * @param {string} [scriptId='']
+ * @param {number | null} [expectedCount=null]
+ * @returns {Array<object>}
+ */
+export function parseLorebookEntries(rawScript, loreLabel = 'lorebook', scriptId = '', expectedCount = null) {
+    const idSuffix = scriptId ? ` (${scriptId})` : '';
+    let entries;
+    if (rawScript === null || rawScript === undefined) {
+        return [];
+    } else if (typeof rawScript === 'string') {
+        const trimmed = rawScript.trim();
+        if (!trimmed) return [];
+        let parsed;
+        try {
+            parsed = JSON.parse(trimmed);
+        } catch (parseErr) {
+            throw new JanitorHttpError(
+                502,
+                `Invalid JSON in linked lorebook "${loreLabel}"${idSuffix}: ${parseErr.message}`,
+                { statusText: 'Corrupt linked JanitorAI lorebook data' },
+            );
+        }
+        if (!Array.isArray(parsed)) {
+            throw new JanitorHttpError(
+                502,
+                `Linked lorebook "${loreLabel}"${idSuffix} did not contain an entry array`,
+                { statusText: 'Invalid linked JanitorAI lorebook format' },
+            );
+        }
+        entries = parsed;
+    } else if (Array.isArray(rawScript)) {
+        entries = rawScript;
+    } else {
+        throw new JanitorHttpError(
+            502,
+            `Unexpected lorebook format for "${loreLabel}"${idSuffix}`,
+            { statusText: 'Invalid linked JanitorAI lorebook format' },
+        );
+    }
+
+    if (entries.length === 0) {
+        return [];
+    }
+
+    if (typeof expectedCount === 'number' && Number.isFinite(expectedCount) && expectedCount >= 0 && entries.length !== expectedCount) {
+        throw new JanitorHttpError(
+            502,
+            `Linked lorebook "${loreLabel}"${idSuffix} entry count mismatch (${entries.length}/${expectedCount})`,
+            { statusText: 'Incomplete linked JanitorAI lorebook entries' },
+        );
+    }
+
+    if (entries.some(e => !e || typeof e !== 'object' || Array.isArray(e))) {
+        throw new JanitorHttpError(
+            502,
+            `Linked lorebook "${loreLabel}"${idSuffix} contains invalid non-object entry items`,
+            { statusText: 'Incomplete linked JanitorAI lorebook entries' },
+        );
+    }
+
+    if (!entries.some(hasMeaningfulLoreEntryContent)) {
+        return [];
+    }
+
+    return entries;
+}
+
+/**
+ * Atomically writes planned lorebook JSON files to disk, rolling back any files created
+ * during the current call if any write fails (without touching pre-existing reused files).
+ * @param {Array<{ alreadyOnDisk: boolean, worldsDir: string, filePath: string, worldFileObj: object, entryCount: number }>} pendingWorldSaves
+ * @param {object} [io]
+ * @returns {string[]} Newly written file paths on disk.
+ */
+export function commitPendingWorldSaves(
+    pendingWorldSaves,
+    {
+        writeFn = writeFileAtomicSync,
+        unlinkFn = fs.unlinkSync,
+        mkdirFn = fs.mkdirSync,
+        existsFn = fs.existsSync,
+    } = {},
+) {
+    const writtenPaths = [];
+    for (const item of pendingWorldSaves) {
+        if (item.alreadyOnDisk) {
+            console.info(`[Silly-CloudFix] Reusing identical existing lorebook on disk: ${item.filePath}`);
+            continue;
+        }
+        try {
+            if (!existsFn(item.worldsDir)) {
+                mkdirFn(item.worldsDir, { recursive: true });
+            }
+            writeFn(item.filePath, JSON.stringify(item.worldFileObj, null, 4), 'utf8');
+            writtenPaths.push(item.filePath);
+            console.info(`[Silly-CloudFix] Saved individual lorebook to disk: ${item.filePath} (${item.entryCount} entries)`);
+        } catch (writeErr) {
+            for (const writtenPath of writtenPaths) {
+                try {
+                    unlinkFn(writtenPath);
+                } catch {}
+            }
+            throw new JanitorHttpError(500, `Failed to write lorebook file ${item.filePath}: ${writeErr.message}`, {
+                statusText: 'Failed to save linked lorebook file to disk',
+            });
+        }
+    }
+    return writtenPaths;
+}
+
 function resolveDefaultAvatarPath() {
     const candidates = [
         path.resolve(SERVER_ROOT, DEFAULT_AVATAR_PATH),
@@ -738,6 +1284,22 @@ function cleanJanitorTag(raw) {
         .trim();
 }
 
+/**
+ * Formats card metadata fields such as creator and character_version as "<label>  <url>".
+ * @param {string} label
+ * @param {string} url
+ * @param {string} [fallback='']
+ * @returns {string}
+ */
+export function formatCardMetadataField(label, url, fallback = '') {
+    const cleanLabel = typeof label === 'string' ? label.trim() : '';
+    const cleanUrl = typeof url === 'string' ? url.trim() : '';
+    if (cleanLabel && cleanUrl && cleanLabel !== cleanUrl && !cleanLabel.includes(cleanUrl)) {
+        return `${cleanLabel}  ${cleanUrl}`;
+    }
+    return cleanLabel || cleanUrl || fallback;
+}
+
 function buildDeduplicatedTags(char) {
     const tags = [];
     const seen = new Set();
@@ -756,7 +1318,12 @@ function buildDeduplicatedTags(char) {
 /**
  * Downloads a character card, avatar, and linked public lorebooks from JanitorAI.
  */
-export async function downloadJannyCharacter(uuidInput, request = null) {
+export async function downloadJannyCharacter(uuidInput, request = null, deps = {}) {
+    const fetchJson = deps.fetchJson || fetchJanitorJson;
+    const downloadAvatar = deps.downloadAvatar || downloadCharacterAvatarPng;
+    const commitWorldSaves = deps.commitWorldSaves || commitPendingWorldSaves;
+    const unlinkFn = deps.unlinkFn || fs.unlinkSync;
+
     const cleanUuid = (String(uuidInput || '').match(UUID_FIND_RE) || [''])[0];
     if (!cleanUuid || !UUID_EXACT_RE.test(cleanUuid)) {
         throw new JanitorHttpError(400, `Invalid Janitor character UUID: "${uuidInput}"`, {
@@ -766,140 +1333,162 @@ export async function downloadJannyCharacter(uuidInput, request = null) {
     console.info(`[Silly-CloudFix] Downloading Janitor character: ${cleanUuid}`);
 
     // 1. Fetch character metadata (propagating HTTP errors such as 401/403/404 properly)
-    const char = await fetchJanitorJson(`https://janitorai.com/hampter/characters/${cleanUuid}`);
-    if (!char || (!char.id && !char.name)) {
+    const char = await fetchJson(`https://janitorai.com/hampter/characters/${cleanUuid}`);
+    if (!char || typeof char !== 'object' || (!char.id && !char.name)) {
         throw new JanitorHttpError(404, `Character data not found for UUID: ${cleanUuid}`, {
             statusText: 'Janitor character not found',
         });
     }
+    if (!String(char.name || '').trim()) {
+        throw new JanitorHttpError(502, `Incomplete character payload missing name for UUID: ${cleanUuid}`, {
+            statusText: 'Incomplete Janitor character metadata',
+        });
+    }
     console.info(`[Silly-CloudFix] Extracted Janitor character: "${char.name}" (id: ${char.id})`);
 
-    // 2. Fetch public chat preview (non-fatal if absent)
+    // 2. Fetch public chat preview (non-fatal only when preview is absent/private)
     let previewChar = null;
     try {
-        const prevData = await fetchJanitorJson(`https://janitorai.com/hampter/chats/character/${cleanUuid}/preview`);
+        const prevData = await fetchJson(`https://janitorai.com/hampter/chats/character/${cleanUuid}/preview`);
         previewChar = prevData?.character || null;
     } catch (prevErr) {
+        if (!isBenignOptionalEndpointError(prevErr)) {
+            throw prevErr;
+        }
         console.warn(`[Silly-CloudFix] Chat preview unavailable for ${cleanUuid}: ${prevErr.message}`);
     }
 
-    // 3. Prepare linked public lorebooks in memory (write to disk only after card PNG write succeeds)
+    // 3. Download, validate, and convert avatar FIRST (never write lorebook files if core character/avatar fails)
+    const { pngBuffer } = await downloadAvatar(char);
+
+    // 4. Process linked public lorebooks per-lorebook atomically:
+    // Each complete, non-empty lorebook is saved independently; failed/incomplete/empty lorebooks
+    // are skipped without leaving partial files and never block saving the character sheet itself.
     let primaryCharacterBook = null;
     let primaryWorldName = '';
-    const pendingWorldSaves = [];
+    const committedNewWorldPaths = [];
     const reservedWorldNames = new Set();
 
-    if (char.creator_id) {
+    const creatorId = typeof char.creator_id === 'string' ? char.creator_id.trim() : '';
+    if (creatorId) {
+        let userScripts = [];
         try {
-            const scriptsData = await fetchJanitorJson(`https://janitorai.com/hampter/script/user/${char.creator_id}`);
-            const userScripts = scriptsData?.scripts || [];
-
-            const matchingLorebooks = userScripts.filter(s =>
-                s.type === 'lorebook' &&
-                s.is_code_public !== false &&
-                Array.isArray(s.characters) &&
-                s.characters.some(c => c.id === cleanUuid)
+            const scriptsData = await fetchJson(
+                `https://janitorai.com/hampter/script/user/${creatorId}`,
+                { timeoutSec: 60, maxBuffer: 15 * 1024 * 1024 },
             );
+            if (scriptsData && typeof scriptsData === 'object' && Array.isArray(scriptsData.scripts)) {
+                userScripts = scriptsData.scripts;
+            } else {
+                console.warn(`[Silly-CloudFix] Unexpected creator scripts payload for ${creatorId}; skipping lorebooks for character download`);
+            }
+        } catch (loreListErr) {
+            console.warn(`[Silly-CloudFix] Creator scripts fetch failed for ${creatorId} (character card still continues): ${loreListErr.message}`);
+        }
 
-            if (matchingLorebooks.length > 0) {
-                console.info(`[Silly-CloudFix] Found ${matchingLorebooks.length} linked public lorebook(s)`);
-                matchingLorebooks.sort((a, b) => (b.message_count || 0) - (a.message_count || 0));
+        const matchingLorebooks = userScripts.filter(s =>
+            s &&
+            s.type === 'lorebook' &&
+            s.is_code_public !== false &&
+            Array.isArray(s.characters) &&
+            s.characters.some(c => c && c.id === cleanUuid)
+        );
 
-                const worldsDir = request?.user?.directories?.worlds || path.join(process.cwd(), 'data/default-user/worlds');
+        if (matchingLorebooks.length > 0) {
+            console.info(`[Silly-CloudFix] Found ${matchingLorebooks.length} linked public lorebook(s)`);
+            matchingLorebooks.sort((a, b) => (b.message_count || 0) - (a.message_count || 0));
 
-                for (let lIdx = 0; lIdx < matchingLorebooks.length; lIdx++) {
-                    const scriptMeta = matchingLorebooks[lIdx];
-                    try {
-                        const fullScript = await fetchJanitorJson(`https://janitorai.com/hampter/script/${scriptMeta.id}`);
-                        let entries = [];
-                        if (typeof fullScript.script === 'string') {
-                            try {
-                                entries = JSON.parse(fullScript.script);
-                            } catch {}
-                        } else if (Array.isArray(fullScript.script)) {
-                            entries = fullScript.script;
-                        }
+            const worldsDir = request?.user?.directories?.worlds || path.join(process.cwd(), 'data/default-user/worlds');
 
-                        if (!Array.isArray(entries) || entries.length === 0) continue;
-
-                        const rawTitle = (fullScript.title || `${char.name || 'Janitor'} Lorebook ${lIdx + 1}`).trim();
-                        const baseWorldName = sanitize(rawTitle).trim() || `Janitor_Lorebook_${String(scriptMeta.id).slice(0, 8)}`;
-
-                        const convertedEntries = convertJanitorLoreEntries(entries);
-                        const worldFileObj = characterBookToWorldInfoFile(convertedEntries);
-                        const plan = resolveUniqueWorldTarget(baseWorldName, worldsDir, reservedWorldNames, worldFileObj);
-
-                        pendingWorldSaves.push({
-                            ...plan,
-                            worldsDir,
-                            worldFileObj,
-                            entryCount: convertedEntries.length,
-                        });
-
-                        if (!primaryWorldName) {
-                            primaryWorldName = plan.safeWorldName;
-                            primaryCharacterBook = {
-                                name: plan.safeWorldName,
-                                description: fullScript.description || '',
-                                scan_depth: 100,
-                                token_budget: 2048,
-                                recursive_scanning: true,
-                                extensions: {},
-                                entries: convertedEntries,
-                            };
-                        }
-                    } catch (singleLoreErr) {
-                        console.warn(`[Silly-CloudFix] Failed to fetch lorebook ${scriptMeta.id}: ${singleLoreErr.message}`);
+            for (let lIdx = 0; lIdx < matchingLorebooks.length; lIdx++) {
+                const scriptMeta = matchingLorebooks[lIdx];
+                const loreLabel = scriptMeta?.title || scriptMeta?.name || scriptMeta?.id || `#${lIdx + 1}`;
+                let reservedCandidate = '';
+                try {
+                    const fullScript = await fetchJson(
+                        `https://janitorai.com/hampter/script/${scriptMeta.id}`,
+                        { timeoutSec: 90, maxBuffer: 32 * 1024 * 1024 },
+                    );
+                    if (!fullScript || typeof fullScript !== 'object') {
+                        throw new Error('Empty or invalid script response object');
                     }
+
+                    const rawExpectedCount =
+                        fullScript.entry_count ??
+                        fullScript.entries_count ??
+                        scriptMeta.entry_count ??
+                        scriptMeta.entries_count;
+                    const expectedCount =
+                        (typeof rawExpectedCount === 'number' && Number.isFinite(rawExpectedCount) && rawExpectedCount >= 0)
+                            ? rawExpectedCount
+                            : null;
+
+                    const entries = parseLorebookEntries(fullScript.script, loreLabel, scriptMeta.id, expectedCount);
+                    if (entries.length === 0) {
+                        console.warn(`[Silly-CloudFix] Skipping empty lorebook "${loreLabel}" (${scriptMeta.id})`);
+                        continue;
+                    }
+
+                    const convertedEntries = convertJanitorLoreEntries(entries);
+                    if (convertedEntries.length !== entries.length || convertedEntries.length === 0) {
+                        throw new Error(`Entry conversion count mismatch (${convertedEntries.length}/${entries.length})`);
+                    }
+
+                    const worldFileObj = characterBookToWorldInfoFile(convertedEntries);
+                    const serializedCount = worldFileObj?.entries ? Object.keys(worldFileObj.entries).length : 0;
+                    if (serializedCount !== convertedEntries.length || serializedCount === 0) {
+                        throw new Error(`Serialized world entry count mismatch (${serializedCount}/${convertedEntries.length})`);
+                    }
+
+                    const rawTitle = (typeof fullScript.title === 'string' && fullScript.title.trim())
+                        ? fullScript.title.trim()
+                        : `${char.name || 'Janitor'} Lorebook ${lIdx + 1}`;
+                    const baseWorldName = sanitize(rawTitle).trim() || `Janitor_Lorebook_${String(scriptMeta.id).slice(0, 8)}`;
+
+                    const plan = resolveUniqueWorldTarget(baseWorldName, worldsDir, reservedWorldNames, worldFileObj);
+                    if (!plan.alreadyOnDisk) {
+                        reservedCandidate = plan.safeWorldName;
+                    }
+
+                    const saveItem = {
+                        ...plan,
+                        worldsDir,
+                        worldFileObj,
+                        entryCount: convertedEntries.length,
+                    };
+                    const written = commitWorldSaves([saveItem]);
+                    if (Array.isArray(written)) {
+                        committedNewWorldPaths.push(...written);
+                    } else if (!plan.alreadyOnDisk) {
+                        committedNewWorldPaths.push(plan.filePath);
+                    }
+
+                    if (!primaryWorldName) {
+                        primaryWorldName = plan.safeWorldName;
+                        primaryCharacterBook = {
+                            name: plan.safeWorldName,
+                            description: typeof fullScript.description === 'string' ? fullScript.description : '',
+                            scan_depth: 100,
+                            token_budget: 2048,
+                            recursive_scanning: true,
+                            extensions: {},
+                            entries: convertedEntries,
+                        };
+                    }
+                } catch (singleLoreErr) {
+                    if (reservedCandidate) {
+                        reservedWorldNames.delete(reservedCandidate);
+                    }
+                    console.warn(`[Silly-CloudFix] Skipping failed/incomplete lorebook "${loreLabel}" (${scriptMeta?.id}): ${singleLoreErr.message}`);
                 }
             }
-        } catch (loreErr) {
-            console.warn(`[Silly-CloudFix] Lorebook fetch failed: ${loreErr.message}`);
         }
     }
 
-    // 4. Download and convert avatar
-    let avatarUrl = '';
-    if (char.avatar) {
-        avatarUrl = char.avatar.startsWith('http')
-            ? char.avatar
-            : `https://ella.janitorai.com/bot-avatars/${char.avatar}?width=1200`;
-    }
-
-    let pngBuffer = null;
-    if (avatarUrl) {
-        try {
-            const { buffer: imgBytes } = await curlRequest(avatarUrl, {
-                binary: true,
-                timeoutSec: 60,
-                maxBuffer: 25 * 1024 * 1024,
-            });
-            if (!imgBytes || imgBytes.length === 0) {
-                throw new Error('Avatar download returned empty buffer');
-            }
-            const isPng = imgBytes.length > 4 &&
-                imgBytes[0] === 0x89 && imgBytes[1] === 0x50 && imgBytes[2] === 0x4e && imgBytes[3] === 0x47;
-            if (isPng) {
-                pngBuffer = imgBytes;
-            } else {
-                const jimpImg = typeof Jimp.fromBuffer === 'function'
-                    ? await Jimp.fromBuffer(imgBytes)
-                    : await Jimp.read(imgBytes);
-                pngBuffer = await jimpImg.getBuffer(JimpMime.png);
-            }
-        } catch (imgErr) {
-            console.warn(`[Silly-CloudFix] Avatar download/conversion failed (${imgErr.message}); falling back to default avatar.`);
-        }
-    }
-
-    if (!pngBuffer) {
-        pngBuffer = await fs.promises.readFile(resolveDefaultAvatarPath());
-    }
-
-    // 5. Build Character Card V2 payload
+    // 5. Build Character Card V2 payload (optional metadata fields: creator, character_version, creator_notes, tags degrade gracefully)
     // Preserve HTML creator bio only in creator_notes; keep description empty on private bots if personality is hidden.
-    const rawDesc = (char.description || '').trim();
-    const firstMes = (previewChar?.first_message || char.first_message || '').trim();
+    const rawDesc = typeof char.description === 'string' ? char.description.trim() : '';
+    const firstMes = (previewChar?.first_message || (typeof char.first_message === 'string' ? char.first_message : '') || '').trim();
     const rawAltGreetings = (Array.isArray(previewChar?.first_messages) && previewChar.first_messages.length > 0)
         ? previewChar.first_messages.map(m => (typeof m === 'string' ? m : (m?.message || '')))
         : (Array.isArray(char.first_messages) ? char.first_messages.map(m => (typeof m === 'string' ? m : (m?.message || ''))) : []);
@@ -919,27 +1508,34 @@ export async function downloadJannyCharacter(uuidInput, request = null) {
         ? reqUrl
         : `https://janitorai.com/characters/${cleanUuid}`;
 
-    const creatorProfileUrl = char.creator_id
-        ? `https://janitorai.com/profiles/${char.creator_id}`
-        : (char.creator_name || 'JanitorAI');
+    const creatorName = typeof char.creator_name === 'string' ? char.creator_name.trim() : '';
+    const creatorProfileUrl = creatorId
+        ? `https://janitorai.com/profiles/${creatorId}`
+        : '';
+    const creatorField = formatCardMetadataField(creatorName, creatorProfileUrl, 'JanitorAI');
+
+    const rawVersion = typeof char.character_version === 'string'
+        ? char.character_version.trim()
+        : (typeof char.version === 'string' ? char.version.trim() : '');
+    const characterVersionField = formatCardMetadataField(rawVersion || '1.0', characterPageUrl);
 
     const tavernCard = {
         spec: 'chara_card_v2',
         spec_version: '2.0',
         data: {
-            name: char.name || 'Janitor Character',
+            name: String(char.name || 'Janitor Character').trim() || 'Janitor Character',
             description: stripJanitorFooter(char.personality),
-            personality: (char.tavern_personality || '').trim(),
+            personality: typeof char.tavern_personality === 'string' ? char.tavern_personality.trim() : '',
             scenario: stripJanitorFooter(char.scenario),
             first_mes: firstMes,
-            mes_example: (char.example_dialogs || '').trim(),
+            mes_example: typeof char.example_dialogs === 'string' ? char.example_dialogs.trim() : '',
             creator_notes: rawDesc,
             system_prompt: '',
             post_history_instructions: '',
             alternate_greetings: altGreetings,
             tags: buildDeduplicatedTags(char),
-            creator: creatorProfileUrl,
-            character_version: characterPageUrl,
+            creator: creatorField,
+            character_version: characterVersionField,
             extensions: {
                 janitor_id: char.id,
                 ...(primaryWorldName ? { world: primaryWorldName } : {}),
@@ -948,23 +1544,16 @@ export async function downloadJannyCharacter(uuidInput, request = null) {
         },
     };
 
-    const buffer = write(pngBuffer, JSON.stringify(tavernCard));
-
-    // Commit lorebook files to disk only after the card buffer succeeded
-    for (const item of pendingWorldSaves) {
-        if (item.alreadyOnDisk) {
-            console.info(`[Silly-CloudFix] Reusing identical existing lorebook on disk: ${item.filePath}`);
-            continue;
+    let buffer;
+    try {
+        buffer = write(pngBuffer, JSON.stringify(tavernCard));
+    } catch (cardWriteErr) {
+        for (const writtenPath of committedNewWorldPaths) {
+            try {
+                unlinkFn(writtenPath);
+            } catch {}
         }
-        try {
-            if (!fs.existsSync(item.worldsDir)) {
-                fs.mkdirSync(item.worldsDir, { recursive: true });
-            }
-            writeFileAtomicSync(item.filePath, JSON.stringify(item.worldFileObj, null, 4), 'utf8');
-            console.info(`[Silly-CloudFix] Saved individual lorebook to disk: ${item.filePath} (${item.entryCount} entries)`);
-        } catch (writeErr) {
-            console.warn(`[Silly-CloudFix] Failed to write lorebook file ${item.filePath}: ${writeErr.message}`);
-        }
+        throw cardWriteErr;
     }
 
     const safeCharName = sanitize(String(char.name || '').trim()).trim();
@@ -1029,7 +1618,7 @@ export function createContentInterceptorRouter(downloader = downloadJannyCharact
     async function handleImport(req, res, next, targetUrlOrId, { fallbackNextOnNotFound = false } = {}) {
         try {
             const cleanId = (String(targetUrlOrId || '').match(UUID_FIND_RE) || [targetUrlOrId])[0];
-            const result = await downloader(cleanId, req);
+            const result = await runWithUuidQueue(cleanId, () => downloader(cleanId, req));
 
             if (!result) {
                 if (fallbackNextOnNotFound && typeof next === 'function') return next();
@@ -1037,8 +1626,12 @@ export function createContentInterceptorRouter(downloader = downloadJannyCharact
                 return res.sendStatus(404);
             }
 
+            const safeHeaderFileName = String(result.fileName || 'character.png')
+                .replace(/[\r\n"\\;]+/g, '_')
+                .trim() || 'character.png';
+
             res.set('Content-Type', result.fileType || 'image/png');
-            res.set('Content-Disposition', `attachment; filename="${encodeURI(result.fileName)}"`);
+            res.set('Content-Disposition', `attachment; filename="${encodeURI(safeHeaderFileName)}"`);
             res.set('X-Custom-Content-Type', 'character');
             res.set('X-Silly-CloudFix', '1');
             if (result.primaryWorldName) {

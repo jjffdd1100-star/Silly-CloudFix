@@ -120,6 +120,10 @@ function installFetchHook() {
             const response = await origFetch.call(window, input, init);
 
             if (!isEnabled || !response?.ok) {
+                if (isEnabled && CHARACTERS_IMPORT_RE.test(pathname)) {
+                    pendingImport = null;
+                    clearFinalizeTimer();
+                }
                 return response;
             }
 
